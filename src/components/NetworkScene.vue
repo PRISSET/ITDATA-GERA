@@ -12,6 +12,9 @@ import landTopology from 'world-atlas/land-110m.json'
 import { chapterWeights } from '../story'
 
 const host = ref<HTMLDivElement | null>(null)
+const emit = defineEmits<{ progress: [value: number]; ready: [] }>()
+// the same .glb is used several times; fetch each file once
+THREE.Cache.enabled = true
 let renderer: THREE.WebGLRenderer | null = null
 let composer: EffectComposer | null = null
 let bloom: UnrealBloomPass | null = null
@@ -24,10 +27,16 @@ let resizeObserver: ResizeObserver | null = null
 let progress = 0
 let disposed = false
 let animationFrame = 0
-let startedAt = 0
+// intro starts when the preloader lifts
+let startedAt = Number.POSITIVE_INFINITY
+let mountedAt = 0
 let environment: THREE.WebGLRenderTarget | null = null
 let pulseLight: THREE.PointLight | null = null
 const lightRig = new THREE.Group()
+const reducedMotionQuery = window.matchMedia('(prefers-reduced-motion: reduce)')
+const mobileQuery = window.matchMedia('(max-width: 760px)')
+// bobbing model mounts, collected once instead of traversing every group each frame
+const floaters: THREE.Object3D[] = []
 const pointer = new THREE.Vector2()
 const pointerSmooth = new THREE.Vector2()
 const geraPulses: THREE.Mesh[] = []
@@ -324,6 +333,7 @@ function mountModel(model: THREE.Group, parent: THREE.Group, position: THREE.Vec
   mount.userData.baseYaw = yaw
   mount.userData.phase = position.x * 1.6
   parent.add(mount)
+  floaters.push(mount)
   return size.multiplyScalar(fit / 2)
 }
 
@@ -380,6 +390,7 @@ function decorateLaptop(model: THREE.Group, mode: 'files' | 'code') {
 
 function loadModels() {
   const loader = new GLTFLoader()
+  let done = 0
   const assets = [
     { path: '/models/network-switch.glb', install: (model: THREE.Group) => {
       mountModel(model, groups[2], new THREE.Vector3(0, -0.03, 0.28), 1.75, 'x', -0.18)
@@ -409,14 +420,31 @@ function loadModels() {
       mountModel(model, groups[5], new THREE.Vector3(1.16, -0.37, 0), 1.03, 'x', -0.36)
     } },
   ]
-  for (const asset of assets) {
-    loader.load(asset.path, ({ scene: model }) => {
-      if (disposed) return
-      asset.install(model)
-    }, undefined, () => {
+  return Promise.allSettled(assets.map(async (asset) => {
+    try {
+      const { scene: model } = await loader.loadAsync(asset.path)
+      if (!disposed) asset.install(model)
+    } catch {
       host.value?.classList.add('model-load-error')
-    })
-  }
+    } finally {
+      emit('progress', ++done / assets.length * 0.9)
+    }
+  }))
+}
+
+// Compile every shader up front (all chapters visible for one pass) so no chapter stutters on first appearance.
+async function warmUp() {
+  if (!renderer || !scene || !camera || !composer) return
+  groups.forEach((group) => { group.visible = true })
+  await renderer.compileAsync(scene, camera)
+  composer.render()
+  await document.fonts.ready
+  emit('progress', 1)
+  // keep the preloader on screen long enough to be seen, even when everything is cached
+  await new Promise((resolve) => setTimeout(resolve, Math.max(0, mountedAt + 2000 - performance.now())))
+  if (disposed) return
+  startedAt = performance.now() * 0.001
+  emit('ready')
 }
 
 function buildFinal() {
@@ -557,6 +585,7 @@ function buildSwarm(count: number) {
       uTime: { value: 0 },
       uScatter: { value: 0 },
       uSize: { value: 26 },
+      uMaxSize: { value: 16 },
       uColorA: { value: new THREE.Color(accent) },
       uColorB: { value: new THREE.Color(data) },
     },
@@ -564,7 +593,7 @@ function buildSwarm(count: number) {
       attribute vec3 p1; attribute vec3 p2; attribute vec3 p3; attribute vec3 p4; attribute vec3 p5; attribute vec3 p6; attribute vec3 p7;
       attribute vec4 seed;
       uniform float w[8];
-      uniform float uTime, uScatter, uSize;
+      uniform float uTime, uScatter, uSize, uMaxSize;
       uniform vec3 uColorA, uColorB;
       varying vec3 vColor; varying float vAlpha;
       void main() {
@@ -581,7 +610,7 @@ function buildSwarm(count: number) {
         pos += 0.035 * vec3(sin(uTime * 0.7 + seed.x * 40.0), cos(uTime * 0.6 + seed.y * 40.0), sin(uTime * 0.5 + seed.z * 40.0));
         vec4 mv = modelViewMatrix * vec4(pos, 1.0);
         gl_Position = projectionMatrix * mv;
-        gl_PointSize = uSize * (0.35 + seed.w * seed.w * 1.4) * (1.0 + uScatter * 0.8 + word * 0.5 + beat * w[0] * 0.6) / -mv.z;
+        gl_PointSize = min(uSize * (0.35 + seed.w * seed.w * 1.4) * (1.0 + uScatter * 0.8 + word * 0.5 + beat * w[0] * 0.6) / -mv.z, uMaxSize);
         vAlpha = (0.55 + 0.45 * sin(uTime * 2.0 + seed.w * 60.0)) * (1.0 + word * 0.9 + beat * w[0] * 0.8);
         vColor = mix(uColorA, uColorB, step(0.9, seed.x));
       }`,
@@ -611,7 +640,11 @@ function buildStars(count: number) {
 
 function setOpacity(group: THREE.Group, opacity: number) {
   group.visible = opacity > 0.002
-  if (!group.visible) return
+  // models load async, so the child count is part of the cache key
+  const key = `${opacity.toFixed(3)}/${group.children.length}`
+  if (!group.visible || group.userData.opacityKey === key) return
+  group.userData.opacityKey = key
+  group.userData.opacity = opacity
   group.traverse((object) => {
     if (object instanceof THREE.Mesh || object instanceof THREE.Line || object instanceof THREE.Sprite) {
       const materials = Array.isArray(object.material) ? object.material : [object.material]
@@ -632,8 +665,8 @@ const cameraTarget = new THREE.Vector3()
 function render() {
   if (!composer || !scene || !camera) return
   const weights = chapterWeights(progress)
-  const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
-  const mobile = window.matchMedia('(max-width: 760px)').matches
+  const reducedMotion = reducedMotionQuery.matches
+  const mobile = mobileQuery.matches
   const time = performance.now() * 0.001
   const intro = reducedMotion ? 1 : easeOutCubic((time - startedAt) / 2.6)
   const position = progress * (groups.length - 1)
@@ -643,11 +676,6 @@ function render() {
   const offsetY = mobile ? 1.35 : 0
   const baseScale = mobile ? 0.62 : 1
 
-  geraPulses.forEach((pulse) => {
-    const t = reducedMotion ? 0.3 : (time * 0.5 + pulse.userData.pulse) % 1
-    pulse.scale.setScalar(1 + t * 4)
-    ;(pulse.material as THREE.Material).userData.baseOpacity = (1 - t) * 0.9
-  })
   groups.forEach((group, index) => {
     const w = weights[index]
     const away = index - position
@@ -657,12 +685,16 @@ function render() {
     group.position.set(centered[index] ? 0 : offsetX, offsetY - index * chapterGap, 0)
     group.scale.setScalar(baseScale * mobileScales[index] * (0.8 + 0.2 * w) * (0.7 + 0.3 * intro))
     if (group.userData.spin && !reducedMotion) group.userData.spin.rotation.y = index === 1 ? -0.21 + Math.sin(time * 0.25) * 0.22 + progress * 1.7 : time * 0.12
-    group.traverse((object) => {
-      if (object.userData.baseY !== undefined) {
-        object.position.y = object.userData.baseY + (reducedMotion ? 0 : Math.sin(time * 1.1 + object.userData.phase) * 0.055)
-        object.rotation.y = object.userData.baseYaw + (reducedMotion ? 0 : Math.sin(time * 0.6 + object.userData.phase) * 0.065)
-      }
-    })
+  })
+  geraPulses.forEach((pulse) => {
+    const t = reducedMotion ? 0.3 : (time * 0.5 + pulse.userData.pulse) % 1
+    pulse.scale.setScalar(1 + t * 4)
+    ;(pulse.material as THREE.Material).opacity = (1 - t) * 0.9 * (groups[1].userData.opacity ?? 0)
+  })
+  floaters.forEach((object) => {
+    if (!object.parent?.visible) return
+    object.position.y = object.userData.baseY + (reducedMotion ? 0 : Math.sin(time * 1.1 + object.userData.phase) * 0.055)
+    object.rotation.y = object.userData.baseYaw + (reducedMotion ? 0 : Math.sin(time * 0.6 + object.userData.phase) * 0.065)
   })
 
   if (swarm) {
@@ -671,6 +703,7 @@ function render() {
     uniforms.uTime.value = time
     uniforms.uScatter.value = reducedMotion ? 0 : transition * 1.6 + (1 - intro) * 4
     uniforms.uSize.value = (mobile ? 18 : 26) * renderer!.getPixelRatio()
+    uniforms.uMaxSize.value = 12 * renderer!.getPixelRatio()
     // the swarm travels with the camera and matches the resting chapter's transform
     const centeredWeight = weights.reduce((sum, w, i) => sum + w * centered[i], 0)
     swarm.position.set(offsetX * (1 - centeredWeight), offsetY - position * chapterGap, 0)
@@ -722,11 +755,13 @@ defineExpose({ setProgress })
 
 onMounted(() => {
   disposed = false
+  mountedAt = performance.now()
   if (!host.value) return
   try {
-    renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' })
+    renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' })
   } catch {
     host.value.classList.add('webgl-unavailable')
+    emit('ready')
     return
   }
   const mobile = window.matchMedia('(max-width: 760px)').matches
@@ -766,8 +801,9 @@ onMounted(() => {
   bloom = new UnrealBloomPass(new THREE.Vector2(1, 1), 0.55, 0.45, 0.62)
   composer.addPass(bloom)
   composer.addPass(new OutputPass())
-  loadModels()
-  resizeObserver = new ResizeObserver(() => {
+  // the preloader never waits longer than 10 s, even on a broken network
+  Promise.race([loadModels(), new Promise((resolve) => setTimeout(resolve, 10000))]).then(warmUp)
+  const applySize = () => {
     if (!host.value || !renderer || !camera || !composer) return
     const { width, height } = host.value.getBoundingClientRect()
     renderer.setSize(width, height, false)
@@ -775,13 +811,29 @@ onMounted(() => {
     composer.setSize(width, height)
     camera.aspect = width / Math.max(height, 1)
     camera.updateProjectionMatrix()
-  })
+  }
+  resizeObserver = new ResizeObserver(applySize)
   resizeObserver.observe(host.value)
   window.addEventListener('pointermove', onPointerMove)
-  startedAt = performance.now() * 0.001
+  // ponytail: steps resolution down only (never back up); good enough for one presentation session
+  let frames = 0
+  let windowStart = performance.now()
   const animate = () => {
     if (disposed) return
     render()
+    frames++
+    const now = performance.now()
+    if (now - windowStart > 1000) {
+      const fps = frames * 1000 / (now - windowStart)
+      const ratio = renderer!.getPixelRatio()
+      // skip the intro second, then drop 0.25 steps while below 50 fps
+      if (now - startedAt * 1000 > 1500 && fps < 50 && ratio > 1) {
+        renderer!.setPixelRatio(Math.max(1, ratio - 0.25))
+        applySize()
+      }
+      frames = 0
+      windowStart = now
+    }
     animationFrame = requestAnimationFrame(animate)
   }
   animate()

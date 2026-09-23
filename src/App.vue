@@ -9,6 +9,7 @@ type SceneHandle = { setProgress: (value: number) => void }
 const scene = ref<SceneHandle | null>(null)
 const activeIndex = ref(0)
 const ready = ref(false)
+const loadProgress = ref(0)
 const displayedNumber = ref('01')
 const transition = { progress: 0 }
 let transitionTween: gsap.core.Tween | null = null
@@ -30,7 +31,7 @@ function update(progress: number) {
 }
 
 function step(direction: number) {
-  if (transitionTween || !direction) return
+  if (!ready.value || transitionTween || !direction) return
   const next = Math.max(0, Math.min(chapters.length - 1, targetIndex + Math.sign(direction)))
   if (next === targetIndex) return
   targetIndex = next
@@ -82,7 +83,6 @@ function onKeyDown(event: KeyboardEvent) {
 
 onMounted(() => {
   update(0)
-  setTimeout(() => { ready.value = true }, 350)
   window.addEventListener('wheel', onWheel, { passive: false })
   window.addEventListener('touchstart', onTouchStart, { passive: true })
   window.addEventListener('touchend', onTouchEnd, { passive: true })
@@ -101,8 +101,15 @@ onBeforeUnmount(() => {
 
 <template>
   <main class="presentation" :class="{ 'is-ready': ready }" aria-label="Präsentation über ITDATA-Gera">
-    <NetworkScene ref="scene" />
+    <NetworkScene ref="scene" @progress="loadProgress = $event" @ready="ready = true" />
     <div class="overlay" aria-hidden="true" />
+
+    <div class="preloader" :class="{ 'is-done': ready }" role="status" :aria-hidden="ready">
+      <img class="preloader-logo" src="/itdata-logo.png" alt="ITDATA-Gera" width="811" height="187" />
+      <div class="preloader-bar"><i :style="{ transform: `scaleX(${loadProgress})` }" /></div>
+      <span class="preloader-count">{{ Math.round(loadProgress * 100) }}%</span>
+      <span class="preloader-credit">Made by Nazar</span>
+    </div>
 
     <header class="masthead">
       <div class="brand-lockup">
